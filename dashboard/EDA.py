@@ -1,0 +1,368 @@
+# -*- coding: utf-8 -*-
+# dashboard/EDA.py
+
+import streamlit as st
+import pandas as pd
+import numpy as np
+import yfinance as yf
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.linear_model import Ridge, Lasso
+from sklearn.preprocessing import StandardScaler
+from sklearn.pipeline import Pipeline
+from sklearn.metrics import mean_absolute_error, mean_squared_error
+import pathlib, datetime
+
+# ---------------- Page setup ----------------
+st.set_page_config(page_title="XLK Nowcast – Interactive EDA & Model", layout="wide")
+st.title("📊 XLK Nowcast – Interactive EDA & Model")
+st.caption(f"File: {pathlib.Path(__file__).resolve()}  |  Launched: {datetime.datetime.now():%Y-%m-%d %H:%M:%S}")
+
+# ---------------- Helpers ----------------
+def pct(x):
+    try:
+        return f"{x*100:.2f}%"
+    except Exception:
+        return "n/a"
+
+def bp(x):
+    try:
+        return f"{x*10000:.0f} bp"
+    except Exception:
+        return "n/a"
+
+def safe(x, default=np.nan):
+    try:
+        return float(x)
+    except Exception:
+        return default
+
+def normalize_100(df: pd.DataFrame) -> pd.DataFrame:
+    return df / df.iloc[0] * 100.0
+
+def corr_phrase(r):
+    if pd.isna(r): return "no clear relationship"
+    if r > 0.8: return "moved almost in lockstep"
+    if r > 0.6: return "were closely aligned"
+    if r > 0.3: return "had a moderate positive relationship"
+    if r > -0.3: return "were weakly related"
+    if r > -0.6: return "tended to move in opposite directions"
+    return "moved strongly in opposite directions"
+
+def max_drawdown(cum_curve: pd.Series) -> float:
+    roll_max = cum_curve.cummax()
+    dd = (cum_curve / roll_max) - 1.0
+    return dd.min()  # negative number
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def load_prices(start="2015-01-01", end=None) -> pd.DataFrame:
+    df = yf.download(["XLK", "SPY", "^VIX"], start=start, end=end,
+                     auto_adjust=True, progress=False, threads=False)["Close"]
+    df = df.dropna()
+    df.columns = ["XLK", "SPY", "VIX"]
+    return df
+
+def make_features(px: pd.DataFrame):
+    ret = px.pct_change().dropna()
+    feat = pd.DataFrame(index=ret.index)
+    feat["ret_xlk"] = ret["XLK"]
+    feat["ret_spy"] = ret["SPY"]
+    feat["ret_vix"] = ret["VIX"]
+    feat["mom_5"]  = ret["XLK"].rolling(5).mean()
+    feat["mom_10"] = ret["XLK"].rolling(10).mean()
+    feat["vol_10"] = ret["XLK"].rolling(10).std()
+    feat["vol_20"] = ret["XLK"].rolling(20).std()
+    feat = feat.dropna()
+
+    # Shift features by 1 day: use info available at t-1 to predict t
+    X = feat[["ret_spy","ret_vix","mom_5","mom_10","vol_10","vol_20"]].shift(1).dropna()
+    y = feat.loc[X.index, "ret_xlk"]
+    return X, y, feat
+
+def evaluate(y_true, y_pred):
+    mae = mean_absolute_error(y_true, y_pred)
+    rmse = np.sqrt(mean_squared_error(y_true, y_pred))
+    da = float((np.sign(y_true) == np.sign(y_pred)).mean())
+    return mae, rmse, da
+
+# ---------------- Load data (with fallback) ----------------
+with st.spinner("Downloading data from Yahoo Finance…"):
+    try:
+        px = load_prices()
+    except Exception as e:
+        st.error(f"Could not load Yahoo data: {e}\nShowing synthetic demo data so the app remains usable.")
+        idx = pd.date_range("2023-01-01", periods=350, freq="B")
+        rng = np.random.default_rng(7)
+        px = pd.DataFrame({
+            "XLK": 100*(1+rng.normal(0,0.010,len(idx))).cumprod(),
+            "SPY": 100*(1+rng.normal(0,0.008,len(idx))).cumprod(),
+            "VIX": 20 + rng.normal(0,0.5,len(idx)).cumsum()
+        }, index=idx)
+
+# ---------------- Sidebar controls ----------------
+st.sidebar.header("Controls")
+start_date = st.sidebar.date_input("Start date", px.index.min().date())
+end_date   = st.sidebar.date_input("End date",   px.index.max().date())
+overlay_spy = st.sidebar.checkbox("Overlay SPY (normalized to 100)", True)
+show_vix_axis = st.sidebar.checkbox("Show VIX on right axis", True)
+show_feature_preview = st.sidebar.checkbox("Show feature preview table", False)
+
+subset = px.loc[str(start_date):str(end_date)].copy()
+if subset.empty:
+    st.warning("Selected date range has no data. Adjust the dates in the sidebar.")
+    st.stop()
+
+# ---------------- Section: Overlay (XLK vs SPY; VIX optional) ----------------
+st.subheader("XLK vs SPY (Normalized to 100)")
+
+left, right = st.columns([2, 1], gap="large")
+
+with left:
+    fig, ax = plt.subplots(figsize=(9,4))
+    norm = normalize_100(subset[["XLK"]])
+    ax.plot(norm.index, norm["XLK"], label="XLK (norm=100)")
+    if overlay_spy:
+        norm_spy = normalize_100(subset[["SPY"]])
+        ax.plot(norm_spy.index, norm_spy["SPY"], label="SPY (norm=100)", alpha=0.85)
+    ax.set_ylabel("Index (base=100)")
+    ax.set_title("Normalized Prices")
+    ax.legend(loc="best")
+    if show_vix_axis:
+        ax2 = ax.twinx()
+        ax2.plot(subset.index, subset["VIX"], alpha=0.35, label="VIX", color="tab:gray")
+        ax2.set_ylabel("VIX")
+    st.pyplot(fig, clear_figure=True)
+
+with right:
+    stats = pd.DataFrame({
+        "Mean Return (daily)": subset.pct_change().mean(),
+        "Volatility (daily std)": subset.pct_change().std(),
+        "Min Price": subset.min(),
+        "Max Price": subset.max()
+    })
+    st.markdown("**Quick Stats (selected window)**")
+    st.dataframe(stats.style.format("{:.6f}"))
+
+# Live interpretation for overlay
+xlk_cum = safe(subset["XLK"].iloc[-1]/subset["XLK"].iloc[0] - 1)
+spy_cum = safe(subset["SPY"].iloc[-1]/subset["SPY"].iloc[0] - 1)
+xlk_ret = subset["XLK"].pct_change().dropna()
+spy_ret = subset["SPY"].pct_change().dropna()
+vix_ret = subset["VIX"].pct_change().dropna()
+corr_xlk_spy = safe(xlk_ret.corr(spy_ret))
+corr_xlk_vix = safe(xlk_ret.corr(vix_ret))
+vol_xlk = safe(xlk_ret.std())
+vol_spy = safe(spy_ret.std())
+vol_ratio = vol_xlk / vol_spy if vol_spy not in [0, np.nan] else np.nan
+
+st.markdown(
+    f"""
+**Findings:** Over this window, **XLK {('outperformed' if xlk_cum>spy_cum else 'underperformed')} SPY**: XLK {pct(xlk_cum)} vs SPY {pct(spy_cum)}.  
+XLK and SPY {corr_phrase(corr_xlk_spy)} (corr = {corr_xlk_spy:.2f}). The relationship with VIX was {corr_phrase(corr_xlk_vix)} (corr = {corr_xlk_vix:.2f}), 
+consistent with **volatility spikes** lining up with **tech weakness**.  
+Daily volatility: XLK {bp(vol_xlk)} vs SPY {bp(vol_spy)} ({'~' + f'{vol_ratio:.2f}×' if pd.notna(vol_ratio) else 'n/a'} the market’s volatility).
+"""
+)
+
+# ---------------- Section: Distribution of returns ----------------
+st.subheader("Distribution of Daily Returns (XLK)")
+rets = xlk_ret.copy()
+fig, ax = plt.subplots()
+sns.histplot(rets, bins=50, kde=True, ax=ax)
+ax.set_xlabel("Daily Return")
+ax.set_ylabel("Frequency")
+st.pyplot(fig, clear_figure=True)
+
+# Live interpretation for returns distribution
+p05, p95 = safe(rets.quantile(0.05)), safe(rets.quantile(0.95))
+mean_r, med_r = safe(rets.mean()), safe(rets.median())
+skew, kurt = safe(rets.skew()), safe(rets.kurt())
+tail_down = (rets < p05).sum()
+tail_up = (rets > p95).sum()
+
+st.markdown(
+    f"""
+**Findings:** Typical daily moves fell between **{pct(p05)}** and **{pct(p95)}**.  
+Average daily return was **{pct(mean_r)}** (median {pct(med_r)}), with **skew = {skew:.2f}** and **kurtosis = {kurt:.2f}**.  
+We observed **{tail_down}** downside tail days (< p5) and **{tail_up}** upside tail days (> p95), underscoring the **fat-tailed** nature of returns.
+"""
+)
+
+# ---------------- Section: Rolling stats ----------------
+st.subheader("Rolling Volatility & Momentum (XLK)")
+roll_left, roll_right = st.columns(2)
+
+with roll_left:
+    fig, ax = plt.subplots(figsize=(7,3.5))
+    vol20 = rets.rolling(20).std()
+    vol20.plot(ax=ax)
+    ax.set_title("20-Day Rolling Volatility")
+    ax.set_ylabel("Std Dev (daily)")
+    st.pyplot(fig, clear_figure=True)
+
+with roll_right:
+    fig, ax = plt.subplots(figsize=(7,3.5))
+    mom10 = rets.rolling(10).mean()
+    mom10.plot(ax=ax)
+    ax.set_title("10-Day Rolling Momentum")
+    ax.set_ylabel("Mean Return (daily)")
+    st.pyplot(fig, clear_figure=True)
+
+# Live interpretation for rolling stats
+last_vol20 = safe(vol20.iloc[-1])
+last_mom10 = safe(mom10.iloc[-1])
+vol_median = safe(vol20.median())
+regime = "elevated risk" if last_vol20 > vol_median*1.25 else ("subdued risk" if last_vol20 < vol_median*0.75 else "typical risk")
+
+st.markdown(
+    f"""
+**Findings:** Recent 20-day volatility is **{bp(last_vol20)}** per day, which implies **{regime}** vs this window’s median.  
+10-day momentum is **{bp(last_mom10)}** per day, indicating **{'short-term strength' if last_mom10>0 else 'short-term softness'}** lately.
+"""
+)
+
+# ---------------- Section: Correlation heatmap ----------------
+st.subheader("Correlation Heatmap (Daily Returns)")
+corr = subset.pct_change().dropna().corr()
+fig, ax = plt.subplots(figsize=(6,4))
+sns.heatmap(corr, annot=True, cmap="coolwarm", center=0, ax=ax)
+st.pyplot(fig, clear_figure=True)
+
+# Live interpretation for correlations
+c_xlk_spy = safe(corr.loc["XLK","SPY"]) if "XLK" in corr.index and "SPY" in corr.columns else np.nan
+c_xlk_vix = safe(corr.loc["XLK","VIX"]) if "XLK" in corr.index and "VIX" in corr.columns else np.nan
+st.markdown(
+    f"""
+**Findings:** In this window, **XLK–SPY corr = {c_xlk_spy:.2f}** (tech {corr_phrase(c_xlk_spy)} with the market).  
+**XLK–VIX corr = {c_xlk_vix:.2f}**, reinforcing the pattern that **higher volatility** coincides with **weaker tech returns**.
+"""
+)
+
+# ---------------- Section: Modeling ----------------
+st.header("Modeling: Ridge/Lasso on Shifted Features")
+
+X, y, feat_all = make_features(px)
+Xw = X.loc[str(start_date):str(end_date)]
+yw = y.loc[Xw.index]
+
+# If the selected window is too short, fall back to full horizon
+if len(Xw) < 120:
+    X_train, X_test = X.iloc[:int(0.8*len(X))], X.iloc[int(0.8*len(X)):]
+    y_train, y_test = y.iloc[:int(0.8*len(y))], y.iloc[int(0.8*len(y)):]
+else:
+    split = int(0.8 * len(Xw))
+    X_train, X_test = Xw.iloc[:split], Xw.iloc[split:]
+    y_train, y_test = yw.iloc[:split], yw.iloc[split:]
+
+if show_feature_preview:
+    st.markdown("**Feature preview (after 1-day shift; no look-ahead):**")
+    st.dataframe(X_train.tail(10).style.format("{:.6f}"))
+
+# Model controls
+col1, col2 = st.columns(2)
+with col1:
+    model_type = st.radio("Model", ["Ridge", "Lasso"], horizontal=True)
+with col2:
+    default_alpha = 1.0 if model_type == "Ridge" else 0.0005
+    alpha = st.slider("Alpha (regularization strength)", 1e-5, 2.0, default_alpha, step=0.0005)
+
+# Train model
+if model_type == "Ridge":
+    model = Pipeline([("scaler", StandardScaler()), ("model", Ridge(alpha=alpha))])
+else:
+    model = Pipeline([("scaler", StandardScaler()), ("model", Lasso(alpha=alpha, max_iter=10000))])
+
+model.fit(X_train, y_train)
+pred = model.predict(X_test)
+
+# Baselines & metrics
+baseline_zero = np.zeros_like(y_test)
+baseline_lag1 = y_test.shift(1).fillna(0.0).values
+res = pd.DataFrame({
+    "Baseline Zero": evaluate(y_test, baseline_zero),
+    "Baseline Lag-1": evaluate(y_test, baseline_lag1),
+    f"{model_type}": evaluate(y_test, pred),
+}, index=["MAE","RMSE","Directional Accuracy"]).T
+
+st.subheader("Performance (Test Set)")
+st.dataframe(res.style.format({"MAE":"{:.6f}","RMSE":"{:.6f}","Directional Accuracy":"{:.3f}"}))
+
+# Live interpretation for metrics
+mae_base = safe(res.loc["Baseline Zero","MAE"])
+mae_model = safe(res.loc[model_type,"MAE"])
+rmse_base = safe(res.loc["Baseline Zero","RMSE"])
+rmse_model = safe(res.loc[model_type,"RMSE"])
+da_base = safe(res.loc["Baseline Lag-1","Directional Accuracy"])
+da_model = safe(res.loc[model_type,"Directional Accuracy"])
+
+imp_mae = (mae_base - mae_model)/mae_base if (pd.notna(mae_base) and mae_base>0) else np.nan
+imp_rmse = (rmse_base - rmse_model)/rmse_base if (pd.notna(rmse_base) and rmse_base>0) else np.nan
+delta_da = da_model - da_base if (pd.notna(da_model) and pd.notna(da_base)) else np.nan
+
+# Coefficient magnitudes on standardized features (to rank signal strength)
+coef_series = None
+try:
+    # Extract the linear model and its coef on scaled features
+    coefs = model.named_steps["model"].coef_
+    coef_series = pd.Series(np.abs(coefs), index=X.columns).sort_values(ascending=False)
+    top_feats = ", ".join([f"{k}" for k in coef_series.head(3).index])
+except Exception:
+    top_feats = "N/A"
+
+st.markdown(
+    f"""
+**Findings:** The **{model_type}** reduced error vs the zero baseline by **MAE {pct(imp_mae)}** and **RMSE {pct(imp_rmse)}**.  
+Directional Accuracy reached **{pct(da_model)}**, a **{pct(delta_da)}** change vs a simple lag-1 rule.  
+Top signals by model weight (standardized): **{top_feats}** — indicating these carried the strongest predictive influence in this window.
+"""
+)
+
+# ---------------- Section: Predicted vs Actual ----------------
+st.subheader("Predicted vs Actual Returns (Test)")
+plot_df = pd.DataFrame({"Actual": y_test, model_type: pred}, index=y_test.index).dropna()
+st.line_chart(plot_df)
+
+# Live interpretation for pred vs actual
+pred_corr = safe(pd.Series(pred, index=y_test.index).corr(y_test))
+big_miss_threshold = 2 * safe(y_test.std())
+big_misses = int(np.sum(np.abs(pred - y_test) > big_miss_threshold)) if pd.notna(big_miss_threshold) else 0
+
+st.markdown(
+    f"""
+**Findings:** Prediction–actual correlation was **{pred_corr:.2f}**.  
+Large errors (>|2×σ|) occurred **{big_misses}** time(s), which is typical for daily horizons where **noise dominates**.
+"""
+)
+
+# ---------------- Section: Toy backtest (long if pred>0, else flat) ----------------
+st.subheader("Toy Strategy: Long if Prediction > 0, Else Flat")
+signal = (pd.Series(pred, index=y_test.index) > 0).astype(int)
+strat_ret = signal * y_test
+cum_strat = (1 + strat_ret).cumprod()
+cum_bh = (1 + y_test).cumprod()
+bt = pd.DataFrame({"Strategy": cum_strat, "Buy&Hold XLK": cum_bh})
+st.line_chart(bt)
+
+# Live interpretation for backtest
+n_days = len(y_test)
+ann_factor = np.sqrt(252)
+ann_ret_strat = (cum_strat.iloc[-1] ** (252/max(n_days,1))) - 1 if n_days > 0 else np.nan
+ann_vol_strat = ann_factor * safe(strat_ret.std())
+sharpe_strat = (ann_ret_strat / ann_vol_strat) if (pd.notna(ann_ret_strat) and pd.notna(ann_vol_strat) and ann_vol_strat>0) else np.nan
+dd_strat = max_drawdown(cum_strat)
+
+ann_ret_bh = (cum_bh.iloc[-1] ** (252/max(n_days,1))) - 1 if n_days > 0 else np.nan
+ann_vol_bh = ann_factor * safe(y_test.std())
+sharpe_bh = (ann_ret_bh / ann_vol_bh) if (pd.notna(ann_ret_bh) and pd.notna(ann_vol_bh) and ann_vol_bh>0) else np.nan
+dd_bh = max_drawdown(cum_bh)
+
+st.markdown(
+    f"""
+**Findings:** Over the test window:  
+- **Strategy** → CAGR {pct(ann_ret_strat)}, vol {pct(ann_vol_strat)}, Sharpe ~ {safe(sharpe_strat):.2f}, max drawdown {pct(dd_strat)}  
+- **Buy & Hold** → CAGR {pct(ann_ret_bh)}, vol {pct(ann_vol_bh)}, Sharpe ~ {safe(sharpe_bh):.2f}, max drawdown {pct(dd_bh)}  
+
+This simple **long/flat** rule can reduce exposure during weak periods (lower drawdowns) when Directional Accuracy is above **50%**, 
+but buy-and-hold may lead during strong uptrends. *(Illustrative only; ignores costs/slippage.)*
+"""
+)
