@@ -4,6 +4,8 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
+import os
+os.environ["YF_USE_CURL"] = "False"   # force yfinance to use 'requests' backend
 import yfinance as yf
 import matplotlib.pyplot as plt
 import seaborn as sns
@@ -11,12 +13,125 @@ from sklearn.linear_model import Ridge, Lasso
 from sklearn.preprocessing import StandardScaler
 from sklearn.pipeline import Pipeline
 from sklearn.metrics import mean_absolute_error, mean_squared_error
-import pathlib, datetime
+import pathlib
+import datetime as _dt
+def next_bday(d):
+    """
+    Return the next business day after date d.
+    Uses pandas BDay (business day offset).
+    """
+    return (pd.to_datetime(d) + pd.tseries.offsets.BDay(1)).date()
+
+def _model_contribs_linear(model, x_row):
+    """
+    For linear models (Ridge/Lasso/LinearRegression):
+    compute feature contributions = coef * feature_value.
+    Returns a Series sorted by contribution size.
+    """
+    try:
+        coefs = model.coef_.ravel()
+        contribs = pd.Series(coefs * x_row.values, index=x_row.index)
+        return contribs
+    except Exception:
+        return None
+
+@st.cache_data(ttl=900, show_spinner=False)
+def fetch_recent_prices(days_back=420):
+    """
+    Robust fetch for XLK, SPY, ^VIX (renamed to VIX).
+    - Tries multi-ticker and per-ticker styles
+    - Uses 'period' and 'start/end'
+    - Falls back to local CSV if online fetch fails
+    Returns: (df, missing)
+    """
+    end = _dt.datetime.today()
+    start = end - _dt.timedelta(days=int(days_back * 1.5))
+    tickers = ["XLK", "SPY", "^VIX"]
+
+    def _rename(df):
+        # normalize to single-level columns: ['XLK','SPY','VIX']
+        if isinstance(df.columns, pd.MultiIndex):
+            if "Close" in df.columns.get_level_values(0):
+                df = df["Close"].copy()
+            else:
+                # some variants return only Close already
+                df = df.copy()
+        df = df.rename(columns={"^VIX": "VIX"})
+        return df
+
+    def _multi_period():
+        try:
+            df = yf.download(tickers, period="10y", auto_adjust=True,
+                             progress=False, threads=False, interval="1d")
+            if not df.empty:
+                return _rename(df)
+        except Exception:
+            pass
+        return pd.DataFrame()
+
+    def _multi_range():
+        try:
+            df = yf.download(tickers, start=start, end=end, auto_adjust=True,
+                             progress=False, threads=False, interval="1d")
+            if not df.empty:
+                return _rename(df)
+        except Exception:
+            pass
+        return pd.DataFrame()
+
+    def _per_ticker():
+        pieces, missing = [], []
+        for t in tickers:
+            try:
+                d = yf.download(t, start=start, end=end, auto_adjust=True,
+                                progress=False, threads=False, interval="1d")
+                if not d.empty and "Close" in d.columns:
+                    name = "VIX" if t == "^VIX" else t
+                    s = d["Close"].rename(name)
+                    s.index = pd.to_datetime(s.index)
+                    pieces.append(s)
+                else:
+                    missing.append("VIX" if t == "^VIX" else t)
+            except Exception:
+                missing.append("VIX" if t == "^VIX" else t)
+        if pieces:
+            df = pd.concat(pieces, axis=1, join="outer").sort_index()
+            df = df.dropna(how="all")
+            return df, missing
+        return pd.DataFrame(), tickers[:]  # all missing
+
+    # Try multi-downloads first
+    df = _multi_period()
+    missing = []
+    if df.empty:
+        df = _multi_range()
+
+    if df.empty:
+        df, missing = _per_ticker()
+
+    # Final fallback: cached CSV if available
+    if df.empty:
+        cache_path = pathlib.Path("data/prices_xlk_spy_vix.csv")
+        if cache_path.exists():
+            cached = pd.read_csv(cache_path, parse_dates=["Date"]).set_index("Date")
+            # Ensure expected cols
+            keep = [c for c in ["XLK", "SPY", "VIX"] if c in cached.columns]
+            if keep:
+                df = cached[keep].copy()
+                missing = [c for c in ["XLK","SPY","VIX"] if c not in df.columns]
+
+    if df.empty:
+        return pd.DataFrame(), (missing if missing else ["XLK","SPY","VIX"])
+
+    # limit to recent window
+    cutoff = pd.to_datetime(end) - pd.Timedelta(days=days_back)
+    df = df.loc[df.index >= cutoff]
+    return df, missing
 
 # ---------------- Page setup ----------------
 st.set_page_config(page_title="XLK Nowcast – Interactive EDA & Model", layout="wide")
 st.title("📊 XLK Nowcast – Interactive EDA & Model")
-st.caption(f"File: {pathlib.Path(__file__).resolve()}  |  Launched: {datetime.datetime.now():%Y-%m-%d %H:%M:%S}")
+st.caption(f"File: {pathlib.Path(__file__).resolve()}  |  Launched: {_dt.datetime.now():%Y-%m-%d %H:%M:%S}")
 
 # ---------------- Helpers ----------------
 def pct(x):
@@ -111,6 +226,7 @@ subset = px.loc[str(start_date):str(end_date)].copy()
 if subset.empty:
     st.warning("Selected date range has no data. Adjust the dates in the sidebar.")
     st.stop()
+show_debug = st.sidebar.checkbox("Show debug info", value=False)
 
 # ---------------- Section: Overlay (XLK vs SPY; VIX optional) ----------------
 st.subheader("XLK vs SPY (Normalized to 100)")
@@ -366,3 +482,120 @@ This simple **long/flat** rule can reduce exposure during weak periods (lower dr
 but buy-and-hold may lead during strong uptrends. *(Illustrative only; ignores costs/slippage.)*
 """
 )
+# ---------------- Section: Live Next-Day Forecast ----------------
+st.header("🔮 Live Next-Day Forecast for XLK")
+st.caption("Pulls recent XLK/SPY/VIX data, rebuilds features, and applies the current model to forecast *tomorrow's* XLK return.")
+
+colA, colB = st.columns([1, 2])
+with colA:
+    run_live = st.button("Run Live Forecast", type="primary", use_container_width=True)
+
+if run_live:
+    with st.spinner("Fetching latest data and computing features…"):
+        px_recent, missing = fetch_recent_prices(days_back=420)
+        
+        ordered = ["XLK", "SPY", "VIX"]
+        px_recent = px_recent[[c for c in ordered if c in px_recent.columns]]
+    
+        # Must have at least XLK and SPY
+        if px_recent.empty or not all(c in px_recent.columns for c in ["XLK", "SPY"]):
+            miss = [c for c in ["XLK", "SPY"] if c not in px_recent.columns]
+            st.error(
+                "Could not load XLK/SPY data, which are required for the model."
+                + (f" Missing: {', '.join(miss)}." if miss else "")
+            )
+            st.stop()
+
+        # Build feature row that matches the model's expected columns:
+        # ret_spy (t-1), ret_vix (t-1), mom_5, mom_10, vol_10, vol_20 (all from XLK).
+        # If VIX is unavailable, set ret_vix = 0.0 (neutral) and warn.
+        ret = px_recent.pct_change().dropna()
+        feat = pd.DataFrame(index=ret.index)
+
+        feat["ret_spy"] = ret["SPY"]
+
+        if "VIX" in px_recent.columns:
+            feat["ret_vix"] = ret["VIX"]
+            vix_available = True
+        else:
+            feat["ret_vix"] = 0.0  # neutral placeholder so pipeline sees the same columns
+            vix_available = False
+
+        feat["mom_5"]  = ret["XLK"].rolling(5).mean()
+        feat["mom_10"] = ret["XLK"].rolling(10).mean()
+        feat["vol_10"] = ret["XLK"].rolling(10).std()
+        feat["vol_20"] = ret["XLK"].rolling(20).std()
+        feat = feat.dropna()
+
+        # Shift by 1 day to avoid look-ahead
+        X_live = feat[["ret_spy", "ret_vix", "mom_5", "mom_10", "vol_10", "vol_20"]].shift(1).dropna()
+        if len(X_live) == 0:
+            st.error("Not enough recent data to compute rolling features. Try increasing days_back.")
+            st.stop()
+
+        x_last = X_live.iloc[-1]
+        last_date = X_live.index[-1]
+        target_day = next_bday(last_date)
+
+        try:
+            pred_next = float(model.predict(x_last.to_frame().T)[0])
+        except Exception as e:
+            st.error(f"Model prediction failed: {e}")
+            st.stop()
+
+        if not vix_available:
+            st.warning("VIX data unavailable. Used a neutral placeholder (ret_vix=0.0) for this forecast; interpretation may be less reliable.")
+
+        # Big metric
+        direction = "UP" if pred_next > 0 else ("DOWN" if pred_next < 0 else "FLAT")
+        delta_txt = "↑" if direction == "UP" else ("↓" if direction == "DOWN" else "→")
+        st.metric(
+            label=f"Predicted XLK next-day return ({target_day})",
+            value=f"{pred_next*100:.2f}%",
+            delta=delta_txt
+        )
+
+        # Context table (include VIX only if present)
+        ctx_rows = {
+            "SPY return (t-1)": x_last["ret_spy"],
+            "XLK 10-day momentum": x_last["mom_10"],
+            "XLK 20-day volatility": x_last["vol_20"],
+        }
+        if vix_available:
+            ctx_rows["VIX return (t-1)"] = x_last["ret_vix"]
+
+        ctx = pd.DataFrame({"Value": list(ctx_rows.values())}, index=list(ctx_rows.keys())).round(6)
+
+        with colB:
+            st.subheader("Context")
+            st.dataframe(ctx.style.format("{:.6f}"))
+
+        # Feature contributions (linear model)
+        contrib = _model_contribs_linear(model, x_last)
+        if contrib is not None and len(contrib) > 0:
+            st.subheader("Feature Contributions (standardized)")
+            fig, ax = plt.subplots(figsize=(7, 3.6))
+            contrib.iloc[:6].sort_values().plot(kind="barh", ax=ax)
+            ax.set_xlabel("Contribution to predicted return")
+            ax.set_ylabel("Feature")
+            st.pyplot(fig, clear_figure=True)
+
+        # Narrative interpretation
+        spy_s = "positive" if x_last["ret_spy"] > 0 else ("negative" if x_last["ret_spy"] < 0 else "flat")
+        mom_s = "supportive" if x_last["mom_10"] > 0 else ("weak" if x_last["mom_10"] < 0 else "neutral")
+        if vix_available:
+            vix_s = "falling" if x_last["ret_vix"] < 0 else ("rising" if x_last["ret_vix"] > 0 else "flat")
+            vix_phrase = f", **VIX** was *{vix_s}*"
+        else:
+            vix_phrase = ", **VIX** unavailable (neutralized in model)"
+
+        st.markdown(
+            f"""
+**Interpretation:** The model calls **{direction}** for the next trading day (**{pred_next*100:.2f}%**).  
+Signals at the close: **SPY** was *{spy_s}*{vix_phrase}, 10-day **momentum** looks *{mom_s}*, and 20-day **volatility** ≈ {bp(float(x_last['vol_20']))} per day.  
+Short-horizon forecasts have high noise; treat this as a directional tilt, not certainty.
+"""
+        )
+else:
+    st.info("Click **Run Live Forecast** to generate a next-day prediction using the current model.")
+
