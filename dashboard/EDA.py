@@ -13,6 +13,8 @@ from sklearn.linear_model import Ridge, Lasso
 from sklearn.preprocessing import StandardScaler
 from sklearn.pipeline import Pipeline
 from sklearn.metrics import mean_absolute_error, mean_squared_error
+from sklearn.model_selection import TimeSeriesSplit
+import scipy.stats
 import pathlib
 import datetime as _dt
 
@@ -86,6 +88,40 @@ def evaluate(y_true, y_pred):
     rmse = np.sqrt(mean_squared_error(y_true, y_pred))
     da = float((np.sign(y_true) == np.sign(y_pred)).mean())
     return mae, rmse, da
+
+def test_directional_accuracy_significance(y_true, y_pred, alpha=0.05):
+    """
+    Test if directional accuracy is significantly better than random (50%) using binomial test.
+    
+    Returns:
+    - directional_accuracy: proportion of correct predictions
+    - p_value: binomial test p-value
+    - is_significant: whether result is significant at alpha level
+    - confidence_interval: 95% confidence interval for directional accuracy
+    """
+    correct_predictions = (np.sign(y_true) == np.sign(y_pred)).astype(int)
+    n_correct = correct_predictions.sum()
+    n_total = len(correct_predictions)
+    
+    directional_accuracy = n_correct / n_total
+    
+    # Binomial test: H0: p = 0.5 (random), H1: p > 0.5
+    p_value = scipy.stats.binomtest(n_correct, n_total, 0.5, alternative='greater').pvalue
+    
+    # 95% confidence interval using Clopper-Pearson (exact) method
+    ci_lower, ci_upper = scipy.stats.beta.interval(0.95, n_correct + 1, n_total - n_correct + 1)
+    
+    is_significant = p_value < alpha
+    
+    return {
+        'directional_accuracy': directional_accuracy,
+        'n_correct': n_correct,
+        'n_total': n_total,
+        'p_value': p_value,
+        'is_significant': is_significant,
+        'confidence_interval': (ci_lower, ci_upper),
+        'alpha': alpha
+    }
 
 def make_features(px: pd.DataFrame):
     """Create features from price data, matching notebook structure."""
@@ -429,6 +465,88 @@ res = pd.DataFrame({
 st.subheader("Performance (Test Set)")
 st.dataframe(res.style.format({"MAE":"{:.6f}","RMSE":"{:.6f}","Directional Accuracy":"{:.3f}"}))
 
+# Statistical significance testing for directional accuracy
+sig_test = test_directional_accuracy_significance(y_test, pred)
+st.subheader("Statistical Significance Testing")
+
+col_sig1, col_sig2 = st.columns(2)
+with col_sig1:
+    st.metric(
+        "Directional Accuracy", 
+        f"{sig_test['directional_accuracy']:.3f}",
+        f"{'Significant' if sig_test['is_significant'] else 'Not significant'}"
+    )
+    st.metric(
+        "Binomial Test p-value",
+        f"{sig_test['p_value']:.4f}",
+        f"{'< 0.05' if sig_test['p_value'] < 0.05 else '≥ 0.05'}"
+    )
+
+with col_sig2:
+    st.metric(
+        "95% Confidence Interval",
+        f"[{sig_test['confidence_interval'][0]:.3f}, {sig_test['confidence_interval'][1]:.3f}]",
+        f"{sig_test['n_correct']}/{sig_test['n_total']} correct"
+    )
+
+# Cross-validation analysis
+st.subheader("Cross-Validation Analysis")
+show_cv = st.checkbox("Show cross-validation results", value=False)
+
+if show_cv:
+    def cross_validate_timeseries(X, y, model_class, alpha, cv_splits=5):
+        """Perform time series cross-validation."""
+        tscv = TimeSeriesSplit(n_splits=cv_splits)
+        cv_results = {'mae_scores': [], 'rmse_scores': [], 'da_scores': []}
+        
+        for fold, (train_idx, val_idx) in enumerate(tscv.split(X)):
+            X_train_fold, X_val_fold = X.iloc[train_idx], X.iloc[val_idx]
+            y_train_fold, y_val_fold = y.iloc[train_idx], y.iloc[val_idx]
+            
+            # Train model on fold
+            if model_type == "Ridge":
+                model_fold = Pipeline([("scaler", StandardScaler()), ("model", Ridge(alpha=alpha))])
+            else:
+                model_fold = Pipeline([("scaler", StandardScaler()), ("model", Lasso(alpha=alpha, max_iter=10000))])
+            
+            model_fold.fit(X_train_fold, y_train_fold)
+            y_pred_fold = model_fold.predict(X_val_fold)
+            
+            # Evaluate
+            mae, rmse, da = evaluate(y_val_fold, y_pred_fold)
+            cv_results['mae_scores'].append(mae)
+            cv_results['rmse_scores'].append(rmse)
+            cv_results['da_scores'].append(da)
+        
+        return cv_results
+    
+    with st.spinner("Running cross-validation..."):
+        cv_results = cross_validate_timeseries(X, y, model_type, alpha, cv_splits=5)
+        
+        # Calculate summary statistics
+        mae_scores = np.array(cv_results['mae_scores'])
+        rmse_scores = np.array(cv_results['rmse_scores'])
+        da_scores = np.array(cv_results['da_scores'])
+        
+        cv_summary = pd.DataFrame({
+            'Mean': [mae_scores.mean(), rmse_scores.mean(), da_scores.mean()],
+            'Std': [mae_scores.std(), rmse_scores.std(), da_scores.std()],
+            'Min': [mae_scores.min(), rmse_scores.min(), da_scores.min()],
+            'Max': [mae_scores.max(), rmse_scores.max(), da_scores.max()]
+        }, index=['MAE', 'RMSE', 'Directional Accuracy'])
+        
+        st.dataframe(cv_summary.style.format("{:.6f}"))
+        
+        # Test if DA is significantly > 0.5 across folds
+        t_stat, p_value = scipy.stats.ttest_1samp(da_scores, 0.5)
+        
+        st.markdown(f"""
+        **Cross-Validation Results:** 
+        - Average Directional Accuracy: **{da_scores.mean():.3f} ± {da_scores.std():.3f}**
+        - DA vs 50% (t-test): **t={t_stat:.3f}, p={p_value:.4f}**
+        - {'✅ Consistently better than random' if p_value < 0.05 else '❌ Not consistently better than random'}
+        """)
+
 # Live interpretation for metrics
 mae_base = safe_float(res.loc["Baseline Zero","MAE"])
 mae_model = safe_float(res.loc[model_type,"MAE"])
@@ -453,8 +571,9 @@ except Exception:
 
 st.markdown(
     f"""
-**Findings:** The **{model_type}** reduced error vs the zero baseline by **MAE {pct(imp_mae)}** and **RMSE {pct(imp_rmse)}**.  
-Directional Accuracy reached **{pct(da_model)}**, a **{pct(delta_da)}** change vs a simple lag-1 rule.  
+**Model Performance Summary:** The **{model_type}** reduced error vs the zero baseline by **MAE {pct(imp_mae)}** and **RMSE {pct(imp_rmse)}**.  
+Directional Accuracy reached **{pct(da_model)}** ({'statistically significant' if sig_test['is_significant'] else 'not statistically significant'}), 
+a **{pct(delta_da)}** change vs a simple lag-1 rule.  
 Top signals by model weight (standardized): **{top_feats}** — indicating these carried the strongest predictive influence in this window.
 """
 )
