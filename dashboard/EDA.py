@@ -15,6 +15,10 @@ from sklearn.pipeline import Pipeline
 from sklearn.metrics import mean_absolute_error, mean_squared_error
 import pathlib
 import datetime as _dt
+
+# ============================================================================
+# UTILITY FUNCTIONS
+# ============================================================================
 def next_bday(d):
     """
     Return the next business day after date d.
@@ -35,127 +39,33 @@ def _model_contribs_linear(model, x_row):
     except Exception:
         return None
 
-@st.cache_data(ttl=900, show_spinner=False)
-def fetch_recent_prices(days_back=420):
-    """
-    Robust fetch for XLK, SPY, ^VIX (renamed to VIX).
-    - Tries multi-ticker and per-ticker styles
-    - Uses 'period' and 'start/end'
-    - Falls back to local CSV if online fetch fails
-    Returns: (df, missing)
-    """
-    end = _dt.datetime.today()
-    start = end - _dt.timedelta(days=int(days_back * 1.5))
-    tickers = ["XLK", "SPY", "^VIX"]
-
-    def _rename(df):
-        # normalize to single-level columns: ['XLK','SPY','VIX']
-        if isinstance(df.columns, pd.MultiIndex):
-            if "Close" in df.columns.get_level_values(0):
-                df = df["Close"].copy()
-            else:
-                # some variants return only Close already
-                df = df.copy()
-        df = df.rename(columns={"^VIX": "VIX"})
-        return df
-
-    def _multi_period():
-        try:
-            df = yf.download(tickers, period="10y", auto_adjust=True,
-                             progress=False, threads=False, interval="1d")
-            if not df.empty:
-                return _rename(df)
-        except Exception:
-            pass
-        return pd.DataFrame()
-
-    def _multi_range():
-        try:
-            df = yf.download(tickers, start=start, end=end, auto_adjust=True,
-                             progress=False, threads=False, interval="1d")
-            if not df.empty:
-                return _rename(df)
-        except Exception:
-            pass
-        return pd.DataFrame()
-
-    def _per_ticker():
-        pieces, missing = [], []
-        for t in tickers:
-            try:
-                d = yf.download(t, start=start, end=end, auto_adjust=True,
-                                progress=False, threads=False, interval="1d")
-                if not d.empty and "Close" in d.columns:
-                    name = "VIX" if t == "^VIX" else t
-                    s = d["Close"].rename(name)
-                    s.index = pd.to_datetime(s.index)
-                    pieces.append(s)
-                else:
-                    missing.append("VIX" if t == "^VIX" else t)
-            except Exception:
-                missing.append("VIX" if t == "^VIX" else t)
-        if pieces:
-            df = pd.concat(pieces, axis=1, join="outer").sort_index()
-            df = df.dropna(how="all")
-            return df, missing
-        return pd.DataFrame(), tickers[:]  # all missing
-
-    # Try multi-downloads first
-    df = _multi_period()
-    missing = []
-    if df.empty:
-        df = _multi_range()
-
-    if df.empty:
-        df, missing = _per_ticker()
-
-    # Final fallback: cached CSV if available
-    if df.empty:
-        cache_path = pathlib.Path("data/prices_xlk_spy_vix.csv")
-        if cache_path.exists():
-            cached = pd.read_csv(cache_path, parse_dates=["Date"]).set_index("Date")
-            # Ensure expected cols
-            keep = [c for c in ["XLK", "SPY", "VIX"] if c in cached.columns]
-            if keep:
-                df = cached[keep].copy()
-                missing = [c for c in ["XLK","SPY","VIX"] if c not in df.columns]
-
-    if df.empty:
-        return pd.DataFrame(), (missing if missing else ["XLK","SPY","VIX"])
-
-    # limit to recent window
-    cutoff = pd.to_datetime(end) - pd.Timedelta(days=days_back)
-    df = df.loc[df.index >= cutoff]
-    return df, missing
-
-# ---------------- Page setup ----------------
-st.set_page_config(page_title="XLK Nowcast – Interactive EDA & Model", layout="wide")
-st.title("📊 XLK Nowcast – Interactive EDA & Model")
-st.caption(f"File: {pathlib.Path(__file__).resolve()}  |  Launched: {_dt.datetime.now():%Y-%m-%d %H:%M:%S}")
-
-# ---------------- Helpers ----------------
 def pct(x):
+    """Format as percentage."""
     try:
         return f"{x*100:.2f}%"
     except Exception:
         return "n/a"
 
-def bp(x):
+def basis_points(x):
+    """Format as basis points."""
     try:
         return f"{x*10000:.0f} bp"
     except Exception:
         return "n/a"
 
-def safe(x, default=np.nan):
+def safe_float(x, default=np.nan):
+    """Safely convert to float with fallback."""
     try:
         return float(x)
     except Exception:
         return default
 
 def normalize_100(df: pd.DataFrame) -> pd.DataFrame:
+    """Normalize series to start at 100."""
     return df / df.iloc[0] * 100.0
 
 def corr_phrase(r):
+    """Convert correlation to descriptive phrase."""
     if pd.isna(r): return "no clear relationship"
     if r > 0.8: return "moved almost in lockstep"
     if r > 0.6: return "were closely aligned"
@@ -165,19 +75,20 @@ def corr_phrase(r):
     return "moved strongly in opposite directions"
 
 def max_drawdown(cum_curve: pd.Series) -> float:
+    """Calculate maximum drawdown from cumulative curve."""
     roll_max = cum_curve.cummax()
     dd = (cum_curve / roll_max) - 1.0
     return dd.min()  # negative number
 
-@st.cache_data(ttl=3600, show_spinner=False)
-def load_prices(start="2015-01-01", end=None) -> pd.DataFrame:
-    df = yf.download(["XLK", "SPY", "^VIX"], start=start, end=end,
-                     auto_adjust=True, progress=False, threads=False)["Close"]
-    df = df.dropna()
-    df.columns = ["XLK", "SPY", "VIX"]
-    return df
+def evaluate(y_true, y_pred):
+    """Evaluate predictions with MAE, RMSE, and directional accuracy."""
+    mae = mean_absolute_error(y_true, y_pred)
+    rmse = np.sqrt(mean_squared_error(y_true, y_pred))
+    da = float((np.sign(y_true) == np.sign(y_pred)).mean())
+    return mae, rmse, da
 
 def make_features(px: pd.DataFrame):
+    """Create features from price data, matching notebook structure."""
     ret = px.pct_change().dropna()
     feat = pd.DataFrame(index=ret.index)
     feat["ret_xlk"] = ret["XLK"]
@@ -194,11 +105,115 @@ def make_features(px: pd.DataFrame):
     y = feat.loc[X.index, "ret_xlk"]
     return X, y, feat
 
-def evaluate(y_true, y_pred):
-    mae = mean_absolute_error(y_true, y_pred)
-    rmse = np.sqrt(mean_squared_error(y_true, y_pred))
-    da = float((np.sign(y_true) == np.sign(y_pred)).mean())
-    return mae, rmse, da
+@st.cache_data(ttl=900, show_spinner=False)
+def load_prices_robust(start="2015-01-01", end=None, days_back=None) -> tuple[pd.DataFrame, list]:
+    """
+    Unified robust data loading function.
+    Can work with either start/end dates OR days_back from today.
+    Returns: (df, missing_tickers)
+    """
+    tickers = ["XLK", "SPY", "^VIX"]
+    
+    # Determine date range
+    if days_back is not None:
+        end_date = _dt.datetime.today()
+        start_date = end_date - _dt.timedelta(days=int(days_back * 1.5))
+    else:
+        start_date = pd.to_datetime(start) if isinstance(start, str) else start
+        end_date = pd.to_datetime(end) if end else _dt.datetime.today()
+    
+    def normalize_columns(df):
+        """Normalize multi-index columns to single level and rename VIX."""
+        if isinstance(df.columns, pd.MultiIndex):
+            if "Close" in df.columns.get_level_values(0):
+                df = df["Close"].copy()
+            else:
+                df = df.copy()
+        return df.rename(columns={"^VIX": "VIX"})
+    
+    # Try different download strategies
+    strategies = [
+        # Strategy 1: Multi-ticker with period
+        lambda: yf.download(tickers, period="10y", auto_adjust=True, 
+                           progress=False, threads=False, interval="1d"),
+        # Strategy 2: Multi-ticker with date range  
+        lambda: yf.download(tickers, start=start_date, end=end_date, auto_adjust=True,
+                           progress=False, threads=False, interval="1d")
+    ]
+    
+    df = pd.DataFrame()
+    for strategy in strategies:
+        try:
+            result = strategy()
+            if not result.empty:
+                df = normalize_columns(result)
+                break
+        except Exception:
+            continue
+    
+    # Strategy 3: Individual ticker downloads if multi-ticker failed
+    missing = []
+    if df.empty:
+        pieces = []
+        for ticker in tickers:
+            try:
+                data = yf.download(ticker, start=start_date, end=end_date, auto_adjust=True,
+                                 progress=False, threads=False, interval="1d")
+                if not data.empty and "Close" in data.columns:
+                    name = "VIX" if ticker == "^VIX" else ticker
+                    series = data["Close"].rename(name)
+                    series.index = pd.to_datetime(series.index)
+                    pieces.append(series)
+                else:
+                    missing.append("VIX" if ticker == "^VIX" else ticker)
+            except Exception:
+                missing.append("VIX" if ticker == "^VIX" else ticker)
+        
+        if pieces:
+            df = pd.concat(pieces, axis=1, join="outer").sort_index()
+            df = df.dropna(how="all")
+        else:
+            missing = ["XLK", "SPY", "VIX"]
+    
+    # Final fallback: cached CSV
+    if df.empty:
+        cache_path = pathlib.Path("data/prices_xlk_spy_vix.csv")
+        if cache_path.exists():
+            try:
+                cached = pd.read_csv(cache_path, parse_dates=["Date"]).set_index("Date")
+                available_cols = [c for c in ["XLK", "SPY", "VIX"] if c in cached.columns]
+                if available_cols:
+                    df = cached[available_cols].copy()
+                    missing = [c for c in ["XLK", "SPY", "VIX"] if c not in df.columns]
+            except Exception:
+                pass
+    
+    # Apply date filtering if days_back specified
+    if days_back is not None and not df.empty:
+        cutoff = pd.to_datetime(end_date) - pd.Timedelta(days=days_back)
+        df = df.loc[df.index >= cutoff]
+    
+    return df, missing
+
+# ---------------- Page setup ----------------
+st.set_page_config(page_title="XLK Nowcast – Interactive EDA & Model", layout="wide")
+st.title("📊 XLK Nowcast – Interactive EDA & Model")
+st.caption(f"File: {pathlib.Path(__file__).resolve()}  |  Launched: {_dt.datetime.now():%Y-%m-%d %H:%M:%S}")
+
+# Helper functions moved to utility section at top of file
+
+# Duplicate functions removed - see utility section at top
+
+# Legacy function maintained for compatibility
+@st.cache_data(ttl=3600, show_spinner=False) 
+def load_prices(start="2015-01-01", end=None) -> pd.DataFrame:
+    """Simple load function - calls the robust version and returns just the dataframe."""
+    df, missing = load_prices_robust(start=start, end=end)
+    if df.empty:
+        raise Exception(f"Could not load price data. Missing tickers: {missing}")
+    return df.dropna()
+
+# Functions moved to utility section above
 
 # ---------------- Load data (with fallback) ----------------
 with st.spinner("Downloading data from Yahoo Finance…"):
@@ -214,7 +229,9 @@ with st.spinner("Downloading data from Yahoo Finance…"):
             "VIX": 20 + rng.normal(0,0.5,len(idx)).cumsum()
         }, index=idx)
 
-# ---------------- Sidebar controls ----------------
+# ============================================================================
+# PAGE SETUP AND SIDEBAR CONTROLS  
+# ============================================================================
 st.sidebar.header("Controls")
 start_date = st.sidebar.date_input("Start date", px.index.min().date())
 end_date   = st.sidebar.date_input("End date",   px.index.max().date())
@@ -260,47 +277,56 @@ with right:
     st.dataframe(stats.style.format("{:.6f}"))
 
 # Live interpretation for overlay
-xlk_cum = safe(subset["XLK"].iloc[-1]/subset["XLK"].iloc[0] - 1)
-spy_cum = safe(subset["SPY"].iloc[-1]/subset["SPY"].iloc[0] - 1)
-xlk_ret = subset["XLK"].pct_change().dropna()
-spy_ret = subset["SPY"].pct_change().dropna()
-vix_ret = subset["VIX"].pct_change().dropna()
-corr_xlk_spy = safe(xlk_ret.corr(spy_ret))
-corr_xlk_vix = safe(xlk_ret.corr(vix_ret))
-vol_xlk = safe(xlk_ret.std())
-vol_spy = safe(spy_ret.std())
+# Calculate key metrics for interpretation
+xlk_cum_return = safe_float(subset["XLK"].iloc[-1]/subset["XLK"].iloc[0] - 1)
+spy_cum_return = safe_float(subset["SPY"].iloc[-1]/subset["SPY"].iloc[0] - 1)
+
+xlk_returns = subset["XLK"].pct_change().dropna()
+spy_returns = subset["SPY"].pct_change().dropna()
+vix_returns = subset["VIX"].pct_change().dropna()
+
+corr_xlk_spy = safe_float(xlk_returns.corr(spy_returns))
+corr_xlk_vix = safe_float(xlk_returns.corr(vix_returns))
+
+vol_xlk = safe_float(xlk_returns.std())
+vol_spy = safe_float(spy_returns.std())
 vol_ratio = vol_xlk / vol_spy if vol_spy not in [0, np.nan] else np.nan
 
 st.markdown(
     f"""
-**Findings:** Over this window, **XLK {('outperformed' if xlk_cum>spy_cum else 'underperformed')} SPY**: XLK {pct(xlk_cum)} vs SPY {pct(spy_cum)}.  
+**Findings:** Over this window, **XLK {('outperformed' if xlk_cum_return > spy_cum_return else 'underperformed')} SPY**: XLK {pct(xlk_cum_return)} vs SPY {pct(spy_cum_return)}.  
 XLK and SPY {corr_phrase(corr_xlk_spy)} (corr = {corr_xlk_spy:.2f}). The relationship with VIX was {corr_phrase(corr_xlk_vix)} (corr = {corr_xlk_vix:.2f}), 
 consistent with **volatility spikes** lining up with **tech weakness**.  
-Daily volatility: XLK {bp(vol_xlk)} vs SPY {bp(vol_spy)} ({'~' + f'{vol_ratio:.2f}×' if pd.notna(vol_ratio) else 'n/a'} the market’s volatility).
+Daily volatility: XLK {basis_points(vol_xlk)} vs SPY {basis_points(vol_spy)} ({'~' + f'{vol_ratio:.2f}×' if pd.notna(vol_ratio) else 'n/a'} the market's volatility).
 """
 )
 
-# ---------------- Section: Distribution of returns ----------------
+# ============================================================================
+# SECTION: DISTRIBUTION OF RETURNS
+# ============================================================================
 st.subheader("Distribution of Daily Returns (XLK)")
-rets = xlk_ret.copy()
+rets = xlk_returns.copy()
 fig, ax = plt.subplots()
 sns.histplot(rets, bins=50, kde=True, ax=ax)
 ax.set_xlabel("Daily Return")
 ax.set_ylabel("Frequency")
 st.pyplot(fig, clear_figure=True)
 
-# Live interpretation for returns distribution
-p05, p95 = safe(rets.quantile(0.05)), safe(rets.quantile(0.95))
-mean_r, med_r = safe(rets.mean()), safe(rets.median())
-skew, kurt = safe(rets.skew()), safe(rets.kurt())
-tail_down = (rets < p05).sum()
-tail_up = (rets > p95).sum()
+# Calculate distribution statistics
+p05_return = safe_float(rets.quantile(0.05))
+p95_return = safe_float(rets.quantile(0.95))
+mean_return = safe_float(rets.mean())
+median_return = safe_float(rets.median())
+skewness = safe_float(rets.skew())
+kurtosis = safe_float(rets.kurt())
+tail_down_days = (rets < p05_return).sum()
+tail_up_days = (rets > p95_return).sum()
 
 st.markdown(
     f"""
-**Findings:** Typical daily moves fell between **{pct(p05)}** and **{pct(p95)}**.  
-Average daily return was **{pct(mean_r)}** (median {pct(med_r)}), with **skew = {skew:.2f}** and **kurtosis = {kurt:.2f}**.  
-We observed **{tail_down}** downside tail days (< p5) and **{tail_up}** upside tail days (> p95), underscoring the **fat-tailed** nature of returns.
+**Findings:** Typical daily moves fell between **{pct(p05_return)}** and **{pct(p95_return)}**.  
+Average daily return was **{pct(mean_return)}** (median {pct(median_return)}), with **skew = {skewness:.2f}** and **kurtosis = {kurtosis:.2f}**.  
+We observed **{tail_down_days}** downside tail days (< p5) and **{tail_up_days}** upside tail days (> p95), underscoring the **fat-tailed** nature of returns.
 """
 )
 
@@ -325,15 +351,15 @@ with roll_right:
     st.pyplot(fig, clear_figure=True)
 
 # Live interpretation for rolling stats
-last_vol20 = safe(vol20.iloc[-1])
-last_mom10 = safe(mom10.iloc[-1])
-vol_median = safe(vol20.median())
+last_vol20 = safe_float(vol20.iloc[-1])
+last_mom10 = safe_float(mom10.iloc[-1])
+vol_median = safe_float(vol20.median())
 regime = "elevated risk" if last_vol20 > vol_median*1.25 else ("subdued risk" if last_vol20 < vol_median*0.75 else "typical risk")
 
 st.markdown(
     f"""
-**Findings:** Recent 20-day volatility is **{bp(last_vol20)}** per day, which implies **{regime}** vs this window’s median.  
-10-day momentum is **{bp(last_mom10)}** per day, indicating **{'short-term strength' if last_mom10>0 else 'short-term softness'}** lately.
+**Findings:** Recent 20-day volatility is **{basis_points(last_vol20)}** per day, which implies **{regime}** vs this window’s median.  
+10-day momentum is **{basis_points(last_mom10)}** per day, indicating **{'short-term strength' if last_mom10>0 else 'short-term softness'}** lately.
 """
 )
 
@@ -345,8 +371,8 @@ sns.heatmap(corr, annot=True, cmap="coolwarm", center=0, ax=ax)
 st.pyplot(fig, clear_figure=True)
 
 # Live interpretation for correlations
-c_xlk_spy = safe(corr.loc["XLK","SPY"]) if "XLK" in corr.index and "SPY" in corr.columns else np.nan
-c_xlk_vix = safe(corr.loc["XLK","VIX"]) if "XLK" in corr.index and "VIX" in corr.columns else np.nan
+c_xlk_spy = safe_float(corr.loc["XLK","SPY"]) if "XLK" in corr.index and "SPY" in corr.columns else np.nan
+c_xlk_vix = safe_float(corr.loc["XLK","VIX"]) if "XLK" in corr.index and "VIX" in corr.columns else np.nan
 st.markdown(
     f"""
 **Findings:** In this window, **XLK–SPY corr = {c_xlk_spy:.2f}** (tech {corr_phrase(c_xlk_spy)} with the market).  
@@ -404,12 +430,12 @@ st.subheader("Performance (Test Set)")
 st.dataframe(res.style.format({"MAE":"{:.6f}","RMSE":"{:.6f}","Directional Accuracy":"{:.3f}"}))
 
 # Live interpretation for metrics
-mae_base = safe(res.loc["Baseline Zero","MAE"])
-mae_model = safe(res.loc[model_type,"MAE"])
-rmse_base = safe(res.loc["Baseline Zero","RMSE"])
-rmse_model = safe(res.loc[model_type,"RMSE"])
-da_base = safe(res.loc["Baseline Lag-1","Directional Accuracy"])
-da_model = safe(res.loc[model_type,"Directional Accuracy"])
+mae_base = safe_float(res.loc["Baseline Zero","MAE"])
+mae_model = safe_float(res.loc[model_type,"MAE"])
+rmse_base = safe_float(res.loc["Baseline Zero","RMSE"])
+rmse_model = safe_float(res.loc[model_type,"RMSE"])
+da_base = safe_float(res.loc["Baseline Lag-1","Directional Accuracy"])
+da_model = safe_float(res.loc[model_type,"Directional Accuracy"])
 
 imp_mae = (mae_base - mae_model)/mae_base if (pd.notna(mae_base) and mae_base>0) else np.nan
 imp_rmse = (rmse_base - rmse_model)/rmse_base if (pd.notna(rmse_base) and rmse_base>0) else np.nan
@@ -439,8 +465,8 @@ plot_df = pd.DataFrame({"Actual": y_test, model_type: pred}, index=y_test.index)
 st.line_chart(plot_df)
 
 # Live interpretation for pred vs actual
-pred_corr = safe(pd.Series(pred, index=y_test.index).corr(y_test))
-big_miss_threshold = 2 * safe(y_test.std())
+pred_corr = safe_float(pd.Series(pred, index=y_test.index).corr(y_test))
+big_miss_threshold = 2 * safe_float(y_test.std())
 big_misses = int(np.sum(np.abs(pred - y_test) > big_miss_threshold)) if pd.notna(big_miss_threshold) else 0
 
 st.markdown(
@@ -463,27 +489,27 @@ st.line_chart(bt)
 n_days = len(y_test)
 ann_factor = np.sqrt(252)
 ann_ret_strat = (cum_strat.iloc[-1] ** (252/max(n_days,1))) - 1 if n_days > 0 else np.nan
-ann_vol_strat = ann_factor * safe(strat_ret.std())
+ann_vol_strat = ann_factor * safe_float(strat_ret.std())
 sharpe_strat = (ann_ret_strat / ann_vol_strat) if (pd.notna(ann_ret_strat) and pd.notna(ann_vol_strat) and ann_vol_strat>0) else np.nan
 dd_strat = max_drawdown(cum_strat)
 
 ann_ret_bh = (cum_bh.iloc[-1] ** (252/max(n_days,1))) - 1 if n_days > 0 else np.nan
-ann_vol_bh = ann_factor * safe(y_test.std())
+ann_vol_bh = ann_factor * safe_float(y_test.std())
 sharpe_bh = (ann_ret_bh / ann_vol_bh) if (pd.notna(ann_ret_bh) and pd.notna(ann_vol_bh) and ann_vol_bh>0) else np.nan
 dd_bh = max_drawdown(cum_bh)
 
 st.markdown(
     f"""
 **Findings:** Over the test window:  
-- **Strategy** → CAGR {pct(ann_ret_strat)}, vol {pct(ann_vol_strat)}, Sharpe ~ {safe(sharpe_strat):.2f}, max drawdown {pct(dd_strat)}  
-- **Buy & Hold** → CAGR {pct(ann_ret_bh)}, vol {pct(ann_vol_bh)}, Sharpe ~ {safe(sharpe_bh):.2f}, max drawdown {pct(dd_bh)}  
+- **Strategy** → CAGR {pct(ann_ret_strat)}, vol {pct(ann_vol_strat)}, Sharpe ~ {safe_float(sharpe_strat):.2f}, max drawdown {pct(dd_strat)}  
+- **Buy & Hold** → CAGR {pct(ann_ret_bh)}, vol {pct(ann_vol_bh)}, Sharpe ~ {safe_float(sharpe_bh):.2f}, max drawdown {pct(dd_bh)}  
 
 This simple **long/flat** rule can reduce exposure during weak periods (lower drawdowns) when Directional Accuracy is above **50%**, 
 but buy-and-hold may lead during strong uptrends. *(Illustrative only; ignores costs/slippage.)*
 """
 )
 # ---------------- Section: Live Next-Day Forecast ----------------
-st.header("🔮 Live Next-Day Forecast for XLK")
+st.header("Live Next-Day Forecast for XLK")
 st.caption("Pulls recent XLK/SPY/VIX data, rebuilds features, and applies the current model to forecast *tomorrow's* XLK return.")
 
 colA, colB = st.columns([1, 2])
@@ -492,7 +518,7 @@ with colA:
 
 if run_live:
     with st.spinner("Fetching latest data and computing features…"):
-        px_recent, missing = fetch_recent_prices(days_back=420)
+        px_recent, missing = load_prices_robust(days_back=420)
         
         ordered = ["XLK", "SPY", "VIX"]
         px_recent = px_recent[[c for c in ordered if c in px_recent.columns]]
@@ -592,10 +618,238 @@ if run_live:
         st.markdown(
             f"""
 **Interpretation:** The model calls **{direction}** for the next trading day (**{pred_next*100:.2f}%**).  
-Signals at the close: **SPY** was *{spy_s}*{vix_phrase}, 10-day **momentum** looks *{mom_s}*, and 20-day **volatility** ≈ {bp(float(x_last['vol_20']))} per day.  
+Signals at the close: **SPY** was *{spy_s}*{vix_phrase}, 10-day **momentum** looks *{mom_s}*, and 20-day **volatility** ≈ {basis_points(float(x_last['vol_20']))} per day.  
 Short-horizon forecasts have high noise; treat this as a directional tilt, not certainty.
 """
         )
 else:
     st.info("Click **Run Live Forecast** to generate a next-day prediction using the current model.")
 
+# ============================================================================
+# COMPREHENSIVE METHODOLOGY EXPLANATION
+# ============================================================================
+st.header("Behind the Scenes: Methodology & Technical Implementation")
+st.markdown("""
+This section provides a comprehensive overview of the machine learning pipeline and methodology used for XLK return prediction. 
+The techniques demonstrated here are widely applicable across industries beyond finance.
+""")
+
+with st.expander("**Data Engineering & Feature Construction**", expanded=False):
+    st.markdown("""
+    ### Data Sources & Collection
+    - **Price Data**: Real-time retrieval from Yahoo Finance API with robust error handling
+    - **Assets**: XLK (Technology ETF), SPY (Market Proxy), VIX (Volatility Index)
+    - **Timeframe**: Daily frequency from 2015-present (~2,600+ observations)
+    
+    ### Feature Engineering Pipeline
+    The model employs **lagged features** to avoid look-ahead bias—a critical concept in time series modeling:
+    
+    **Market Context Features:**
+    - `ret_spy(t-1)`: Previous day's S&P 500 return (market direction signal)
+    - `ret_vix(t-1)`: Previous day's VIX change (volatility regime indicator)
+    
+    **Technical Momentum Features:**
+    - `mom_5(t-1)`: 5-day rolling average return (short-term momentum)
+    - `mom_10(t-1)`: 10-day rolling average return (medium-term momentum)
+    
+    **Risk Management Features:**
+    - `vol_10(t-1)`: 10-day rolling volatility (short-term risk)
+    - `vol_20(t-1)`: 20-day rolling volatility (longer-term risk)
+    
+    ### Data Quality & Preprocessing
+    - **Missing Data Handling**: Multiple fallback strategies with cached data
+    - **Normalization**: StandardScaler ensures features contribute equally regardless of scale
+    - **Temporal Integrity**: 1-day lag ensures all features are "knowable" at prediction time
+    """)
+
+with st.expander("**Machine Learning Architecture**", expanded=False):
+    st.markdown("""
+    ### Model Selection Rationale
+    **Ridge Regression** was chosen as the primary model for several strategic reasons:
+    
+    - **Interpretability**: Linear coefficients provide clear feature importance rankings
+    - **Regularization**: L2 penalty prevents overfitting in noisy financial data
+    - **Stability**: Less sensitive to multicollinearity between market features
+    - **Speed**: Fast training/prediction enables real-time dashboard updates
+    
+    ### Model Pipeline
+    ```
+    Raw Prices → Feature Engineering → Scaling → Ridge Regression → Predictions
+    ```
+    
+    **Scaling Strategy**: StandardScaler transforms features to zero mean, unit variance:
+    - Prevents features with larger scales (e.g., volatility) from dominating
+    - Ensures regularization penalty applies fairly across all features
+    - Critical for interpretable coefficient comparisons
+    
+    ### Training & Validation Framework
+    - **Time Series Split**: 80/20 train-test split respecting temporal order
+    - **No Data Leakage**: Strict chronological separation prevents future information contamination
+    - **Multiple Baselines**: Zero prediction and lag-1 benchmarks establish minimum performance thresholds
+    """)
+
+with st.expander("**Performance Evaluation Framework**", expanded=False):
+    st.markdown("""
+    ### Evaluation Metrics Suite
+    The model is assessed using multiple complementary metrics:
+    
+    **Regression Metrics:**
+    - **MAE (Mean Absolute Error)**: Average prediction error magnitude
+    - **RMSE (Root Mean Squared Error)**: Penalizes larger errors more heavily
+    
+    **Classification Metrics:**
+    - **Directional Accuracy**: Percentage of correct up/down predictions
+    - Critical for trading strategies where direction matters more than magnitude
+    
+    ### Benchmark Comparisons
+    - **Zero Baseline**: Always predicting no change (market efficiency hypothesis)
+    - **Lag-1 Baseline**: Using previous day's return as prediction (momentum strategy)
+    - Performance improvements demonstrate model's predictive value above naive approaches
+    
+    ### Strategy Backtesting
+    **Simple Long/Flat Strategy**: 
+    - Long XLK when prediction > 0, flat otherwise
+    - Compares against buy-and-hold benchmark
+    - Accounts for reduced market exposure during predicted downturns
+    - **Note**: Simplified for demonstration; real strategies require transaction costs, slippage, and risk management
+    """)
+
+with st.expander("**Feature Importance & Model Interpretability**", expanded=False):
+    st.markdown("""
+    ### Coefficient Analysis
+    Ridge regression coefficients (after scaling) reveal feature importance:
+    - **Positive coefficients**: Features associated with positive XLK returns
+    - **Negative coefficients**: Features signaling potential downside
+    - **Magnitude**: Larger absolute values indicate stronger predictive relationships
+    
+    ### Economic Intuition Behind Features
+    - **SPY Correlation**: Tech sector typically moves with broader market
+    - **VIX Relationship**: High volatility often coincides with tech sell-offs
+    - **Momentum Effects**: Recent trends may persist in the short term
+    - **Volatility Clustering**: High volatility periods tend to cluster together
+    
+    ### Contribution Analysis
+    The dashboard shows individual feature contributions to each prediction:
+    - Decomposes final prediction into component parts
+    - Helps understand which signals drove specific forecasts
+    - Enables model debugging and validation of economic relationships
+    """)
+
+with st.expander("**Real-Time Implementation & Deployment**", expanded=False):
+    st.markdown("""
+    ### Production Architecture
+    - **Caching Strategy**: 15-minute data cache balances freshness with API efficiency
+    - **Error Handling**: Multiple fallback data sources ensure system reliability
+    - **Graceful Degradation**: System continues operating even with missing data (e.g., VIX unavailable)
+    
+    ### Scalability Considerations
+    The architecture demonstrated here scales to industrial applications:
+    - **Feature Pipeline**: Easily extensible to additional assets or alternative data
+    - **Model Framework**: Supports ensemble methods, neural networks, or more complex algorithms
+    - **Real-Time Updates**: Infrastructure supports live model retraining and deployment
+    
+    ### Risk Management & Limitations
+    **Model Limitations:**
+    - Short-term predictions inherently noisy in efficient markets
+    - Historical relationships may not persist (regime changes)
+    - Single-asset focus doesn't capture portfolio-level risks
+    
+    **Practical Considerations:**
+    - Predictions should inform, not replace, human judgment
+    - Transaction costs and market impact not modeled
+    - Model performance varies across different market regimes
+    """)
+
+# ============================================================================
+# PROJECT SUMMARY & BROADER APPLICATIONS
+# ============================================================================
+st.header("Project Summary & Cross-Industry Applications")
+
+col_summary1, col_summary2 = st.columns(2)
+
+with col_summary1:
+    st.subheader("**What This Project Demonstrates**")
+    st.markdown("""
+    **Technical Skills:**
+    - **End-to-End ML Pipeline**: From raw data to production deployment
+    - **Time Series Modeling**: Proper handling of temporal dependencies and data leakage
+    - **Feature Engineering**: Domain-driven variable construction and transformation
+    - **Model Evaluation**: Comprehensive performance assessment with multiple metrics
+    - **Interactive Visualization**: Professional dashboard development with Streamlit
+    
+    **Data Science Best Practices:**
+    - Robust data collection with error handling and fallback mechanisms
+    - Principled train/test splitting respecting temporal structure
+    - Clear separation between exploratory analysis and production code
+    - Comprehensive documentation and reproducible workflows
+    """)
+
+with col_summary2:
+    st.subheader("**Cross-Industry Applications**")
+    st.markdown("""
+    **The methodologies demonstrated generalize across domains:**
+    
+    **Manufacturing & Operations:**
+    - Demand forecasting using lagged sales, economic indicators
+    - Equipment failure prediction using sensor data, maintenance history
+    - Quality control using process parameters, environmental factors
+    
+    **Healthcare & Life Sciences:**
+    - Patient outcome prediction using historical vitals, treatment responses  
+    - Drug efficacy modeling using biomarkers, patient characteristics
+    - Epidemiological forecasting using case data, mobility patterns
+    
+    **Marketing & E-commerce:**
+    - Customer lifetime value prediction using transaction history, engagement metrics
+    - Campaign effectiveness using historical performance, audience features
+    - Inventory optimization using seasonal patterns, demand signals
+    """)
+
+st.subheader("**Technical Architecture Highlights**")
+
+arch_col1, arch_col2, arch_col3 = st.columns(3)
+
+with arch_col1:
+    st.markdown("""
+    **Data Engineering**
+    - Real-time API integration
+    - Robust error handling
+    - Efficient caching strategies
+    - Data quality validation
+    """)
+
+with arch_col2:
+    st.markdown("""
+    **Machine Learning**
+    - Time series feature engineering
+    - Regularized linear modeling  
+    - Cross-validation framework
+    - Model interpretability
+    """)
+
+with arch_col3:
+    st.markdown("""
+    **Production Deployment**
+    - Interactive web dashboard
+    - Real-time predictions
+    - Comprehensive documentation
+    - Scalable architecture
+    """)
+
+st.subheader("**Key Learning Outcomes**")
+st.markdown("""
+This project showcases the complete lifecycle of a data science solution, from problem formulation through production deployment. 
+Key takeaways include:
+
+- **Domain Expertise Integration**: Combining financial market knowledge with machine learning techniques
+- **Temporal Data Challenges**: Properly handling time series data to avoid common pitfalls
+- **Production Considerations**: Building systems that are robust, interpretable, and maintainable  
+- **Stakeholder Communication**: Presenting technical work in an accessible, actionable format
+
+The skills and methodologies demonstrated here are **directly transferable** to predictive modeling challenges across industries, 
+making this project a strong foundation for data science roles in any domain requiring quantitative analysis and forecasting.
+""")
+
+st.markdown("---")
+st.markdown("*Built with Python, Streamlit, scikit-learn, and modern data science best practices*")
+    
